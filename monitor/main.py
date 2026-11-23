@@ -2,7 +2,7 @@
 TG Guardian MTProto Monitor v0.5.27
 Author: TG https://t.me/ziixiix
 - Logs in as the user's own Telegram account(s) (Telethon / MTProto).
-- MULTI-ACCOUNT (v0.5.0): one process watches several Telegram accounts
+- MULTI-ACCOUNT: one process watches several Telegram accounts
   that all belong to the same owner. Each account has its own
   TelegramClient, its own session file (tg_guardian_<phone>.session;
   the original account keeps the legacy tg_guardian.session), its own
@@ -22,93 +22,53 @@ Author: TG https://t.me/ziixiix
   the monitor keeps them in memory only, never logs them, and uses
   each exactly once.
 - Polls each account's authorized sessions every 5 min.
-- New device flow (v0.2): report the new session to the Worker (/sync),
+- New device flow: report the new session to the Worker (/sync),
   the Worker alerts the owner with ✅ 是我本人 / ⛔ 踢掉 buttons.
   The monitor polls the Worker's /pending decisions every 120 s:
     - owner taps 是我本人 -> session is added to the trusted baseline
     - owner taps 踢掉      -> session is revoked immediately
     - no reply in 10 min  -> session is revoked automatically
   The monitor's own session is in the trusted baseline and is never revoked.
-- v0.3: also listens for Telegram's own 777000 login-code messages in
+- Also listens for Telegram's own 777000 login-code messages in
   real time. A half-finished login (correct code, wrong 2FA password)
   never becomes an authorized session, so session polling cannot see it —
   but the code message arrives the moment the code is requested, so the
   monitor alerts immediately. The alert and the logs NEVER include the
   code digits themselves.
-- v0.4: code alerts go through the Worker (/code-alert) with ✅ 同意 /
-  ⛔ 拒绝 buttons. If the owner taps 拒绝, the monitor tries to freeze
-  code delivery: a separate throwaway client requests ONE code and enters
+- Code alerts go through the Worker (/code-alert) with three buttons:
+  ✅ 同意 / 🧊 拒绝·冻结验证码 / 🔒 拒绝·冻结二级密码.
+  deny_code runs only the wrong-code freeze; deny_2fa runs only the
+  Flood (2FA) protection; a legacy "deny" still runs both. No reply
+  in 5 min auto-runs the Flood protection only. The /code-freeze
+  report carries a mode field ("code" / "2fa" / "both") so the Worker
+  can display which protection ran.
+- Flood protection tries a no-code path first, using the monitor's own
+  already-authorized session (no tdata needed, no fresh code requested):
+  it calls account.GetPassword + auth.CheckPassword with a deliberately
+  wrong 2FA password 5 times. If the no-code path does not return an
+  explicit flood, the monitor falls back to the login-flow path (fresh
+  code entered correctly, then wrong 2FA 5 times). The result alert
+  says which path ran. Never upload a tdata bundle anywhere: it is a
+  live login key, and the monitor already holds its own authorized
+  session that can do everything an authorized session can do.
+- Code freeze: a separate throwaway client requests ONE code and enters
   a deliberately wrong code 5 times against it, aiming to trigger
-  Telegram's wrong-code limit (account can't receive/send codes for ~1h;
-  recovery time is recorded as an estimate). The freeze never touches
-  the monitor's own session, and the throwaway session file is deleted
-  after. While a freeze runs, code alerts are suppressed for 15 min
-  because the freeze itself generates a code message.
-- v0.4.1: fixed a repeat-freeze bug — save_state() used to replace the whole
-  state file, wiping "code_processed", so a denied code event was frozen
-  again on every 120 s poll. State saves now merge, and frozen event ids
-  are also kept in memory for the process lifetime.
-- v0.4.3: hourly heartbeat — once an hour the monitor uploads a heartbeat
-  and the current device snapshot to the Worker (/heartbeat), so /status
-  shows the monitor is alive and /devices shows the snapshot. 2 KV writes
-  per hour = 48/day, far under the free 1,000/day limit. Also: a code
-  request with no owner reply in 10 min is auto-frozen, same as the
-  new-device auto-revoke.
-- v0.4.4: fixed the heartbeat crash — upload_heartbeat used VERSION but
-  no VERSION constant existed (NameError), so the hourly heartbeat never
-  uploaded. The constant is defined now.
-- v0.4.5: heartbeat now sends structured device info (device/platform/
-  app/country/region/created/active/current) so the Worker can render the
-  snapshot as short readable lines instead of the raw pipe-separated
-  dump.
-- v0.4.8: the 2FA protection now tries a no-code path FIRST, using the
-  monitor's own already-authorized session (no tdata needed, no fresh
-  code requested): it calls account.GetPassword + auth.CheckPassword
-  with a deliberately wrong 2FA password 5 times. Whether Telegram
-  counts those attempts toward the login flood is NOT verified — the
-  only verified trigger is the login flow — so if the no-code path does
-  not return an explicit flood, the monitor falls back to the login-flow
-  path (fresh code entered correctly, then wrong 2FA 5 times). The
-  result alert says which path ran. The uploaded tdata bundle is NOT
-  used: it is a live login key, and the monitor already holds its own
-  authorized session that can do everything an authorized session can
-  do, so copying the tdata to the server would add risk and no
-  capability. Never upload a tdata bundle anywhere.
-- v0.4.8 also: auto times are no longer hardcoded — the monitor reads
-  auto_code_after / auto_revoke_after (seconds) and alerts_enabled from
-  the Worker's /pending response on every poll (settings live in Worker
-  KV, changed with /set_guard and /set_revoke; env vars remain the
-  fallback defaults). Alert texts use the configured minutes instead
-  of fixed "5 分钟" / "10 分钟".
-- v0.4.7: code decisions are now three-way. The Worker alert has three
-  buttons: ✅ 同意 / 🧊 拒绝·冻结验证码 / 🔒 拒绝·冻结二级密码.
-  deny_code runs only the wrong-code freeze; deny_2fa runs only the 2FA
-  protection; a legacy "deny" (Worker <= 1.3.7, one 拒绝 button) still
-  runs both. No reply in 5 min auto-runs the 2FA protection ONLY, because
-  its block lasts until next day while the code-request block often
-  clears sooner. The /code-freeze report now carries a mode field
-  ("code" / "2fa" / "both") so the Worker can display which protection ran.
-- v0.4.6: code protection is now two layers, both run on 拒绝 and on
-  5 min of silence (AUTO_CODE_AFTER=300, separate from the 10 min
-  new-device auto-revoke):
-  (1) 2FA protection FIRST — a throwaway client requests ONE fresh code,
-      the monitor captures that code from its own 777000 message (in
-      memory only, never logged, never sent anywhere), enters it
-      correctly to reach the 2FA step, then enters a deliberately wrong
-      2FA password 5 times to trigger PHONE_PASSWORD_FLOOD (recovery time estimated by trigger count in 24h: 1st-3rd 1h, 4th 6h, 5th+ 24h).
-      If the code is somehow accepted without 2FA, the throwaway client
-      logs out immediately and aborts.
-  (2) Code freeze — the existing wrong-code freeze (ONE code, entered
-      wrong 5 times). It runs after the 2FA protection; if the account
-      is already flooded by step (1), its code request may be refused
-      with FloodWait — that is reported honestly, not treated as a
-      failure of the protection, because the account is already locked.
-  Either layer also locks the owner out of new-device logins for the
-  same period; already-logged-in sessions are unaffected.
+  Telegram's wrong-code limit (recovery time is recorded as an estimate).
+  The freeze never touches the monitor's own session, and the throwaway
+  session file is deleted after. While a freeze runs, code alerts are
+  suppressed for 15 min because the freeze itself generates a code message.
+- Auto times are read from the Worker's /pending response on every poll
+  (auto_code_after / auto_revoke_after in seconds, alerts_enabled;
+  settings live in Worker KV, changed with /set_guard and /set_revoke;
+  env vars remain the fallback defaults).
+- Hourly heartbeat: once an hour the monitor uploads a heartbeat and the
+  current device snapshot to the Worker (/heartbeat), so /status shows
+  the monitor is alive and /devices shows the snapshot. 2 KV writes per
+  hour = 48/day, far under the free 1,000/day limit.
 - KV writes happen only on new-device events (via the Worker), never on
   every poll, so the Cloudflare free KV write limit is not a problem.
 
-Env vars (set in Enzonic Startup / Variables, never commit them):
+Env vars (set in your server environment / Variables, never commit them):
   API_ID, API_HASH, BOT_TOKEN, OWNER_ID
   PHONE            main account's phone; also the seed account
   SESSION_STRING   optional, Telethon StringSession (avoids interactive login)
