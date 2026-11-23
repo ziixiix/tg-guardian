@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.28
+ * TG Guardian Worker v1.4.29
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -230,9 +230,19 @@
  * reverted at the owner's request - setMyCommands again lists
  * every command (30, incl. /stop_qr), so typing "/" in the
  * client shows them all. ensureMenu behavior is unchanged.
+ *
+ * QR WAKE-UP CARRIES THE ORDER (v1.4.29): tapping the QR-login
+ * button now sends the wake-up WITH the start order as its second
+ * line ("onboard_qr:<phone>:<created_at digits>:<ts>"), and every
+ * stop path (the stop button under each QR photo, /stop_qr and
+ * /cancel_add) sends "onboard_qr_stop:<phone>:stop:<ts>". The
+ * monitor acts on the order itself instead of waiting for the KV
+ * write to propagate to its /pending read - the same fix v1.4.11
+ * made for decisions. The KV record is still written first;
+ * /pending stays the backstop.
  */
 
-const VERSION = "1.4.28";
+const VERSION = "1.4.29";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -1170,6 +1180,7 @@ async function runCommand(env, chatId, fromId, rawText, ctx) {
     delete item.code;
     delete item.password;
     await saveOnboard(env, onboard);
+    if (ctx) ctx.waitUntil(sendWakeup(env, `onboard_qr_stop:${phone}:stop:${Math.floor(Date.now()/1000)}`));
     return sendMessage(env, chatId, `正在取消添加账号 ${displayPhone(phone)}…`, true);
   }
   if (cmd === "/stop_qr") {
@@ -1198,7 +1209,7 @@ async function runCommand(env, chatId, fromId, rawText, ctx) {
       item = qrItems[0];
     }
     await saveOnboard(env, onboard.filter((o) => o.phone !== item.phone));
-    if (ctx) ctx.waitUntil(sendWakeup(env));
+    if (ctx) ctx.waitUntil(sendWakeup(env, `onboard_qr_stop:${item.phone}:stop:${Math.floor(Date.now()/1000)}`));
     return sendMessage(env, chatId, `🛑 已停止扫码登录【${displayPhone(item.phone)}】。重新添加发 /add_account ${displayPhone(item.phone)}。`, true);
   }
   if (cmd === "/remove_account") {
@@ -2196,9 +2207,9 @@ if (data.startsWith("sustain_flood_off:")) { const phone = normalizePhone((data.
 if (data.startsWith("sustain_mode:loop:")) { const phone = normalizePhone((data.split(":")[2] || '')); const s = phone ? await setSustainMode(env, phone, "loop") : null; if (s) { await answerCallback(env, cb.id, "已改成循环"); await sendMessage(env, cb.message.chat.id, `🔁 持续Flood保护已改成循环【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次 Flood 保护，一直循环，直到用 /sustain_flood_off 取消。\n下次触发：${fmtTime(s.trigger_at)}。`, true); } else { await answerCallback(env, cb.id, "先设置一个时间"); } return; }
 if (data.startsWith("sustain_mode:count:")) { const phone = normalizePhone((data.split(":")[2] || '')); const s = phone ? await getSustain(env, phone) : null; if (s) { await answerCallback(env, cb.id, "选次数"); await sendMessage(env, cb.message.chat.id, `🔢 持续Flood保护【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次，选一共触发几次，到次数就自动停止。`, true, sustainCountKeyboard(phone)); } else { await answerCallback(env, cb.id, "先设置一个时间"); } return; }
 if (data.startsWith("sustain_count:")) { const parts = data.split(":"); const n = parseInt(parts[1] || '', 10); const phone = normalizePhone(parts[2] || ''); const s = (phone && n >= 1 && n <= 100) ? await setSustainMode(env, phone, "count", n) : null; if (s) { await answerCallback(env, cb.id, `共 ${n} 次`); await sendMessage(env, cb.message.chat.id, `🔢 持续Flood保护已设置【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次 Flood 保护，共 ${n} 次，到次数自动停止。\n下次触发：${fmtTime(s.trigger_at)}。`, true); } else { await answerCallback(env, cb.id, "次数无效"); } return; }
-if (data.startsWith("onboard:qr_stop:")) { const phone = normalizePhone(data.slice("onboard:qr_stop:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item) { await saveOnboard(env, onboard.filter((o) => o.phone !== phone)); await answerCallback(env, cb.id, "已停止扫码登录"); await sendMessage(env, cb.message.chat.id, `🛑 已停止扫码登录【${displayPhone(phone)}】。重新添加发 /add_account ${displayPhone(phone)}。`, true); ctx.waitUntil(sendWakeup(env)); } else { await answerCallback(env, cb.id, "已经结束了"); } return; }
+if (data.startsWith("onboard:qr_stop:")) { const phone = normalizePhone(data.slice("onboard:qr_stop:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item) { await saveOnboard(env, onboard.filter((o) => o.phone !== phone)); await answerCallback(env, cb.id, "已停止扫码登录"); await sendMessage(env, cb.message.chat.id, `🛑 已停止扫码登录【${displayPhone(phone)}】。重新添加发 /add_account ${displayPhone(phone)}。`, true); ctx.waitUntil(sendWakeup(env, `onboard_qr_stop:${phone}:stop:${Math.floor(Date.now()/1000)}`)); } else { await answerCallback(env, cb.id, "已经结束了"); } return; }
 if (data.startsWith("onboard:code:")) { const phone = normalizePhone(data.slice("onboard:code:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item && item.state === "choose_method") { item.mode = "code"; item.state = "pending_send"; await saveOnboard(env, onboard); await answerCallback(env, cb.id, "短信登录"); await sendMessage(env, cb.message.chat.id, `已登记账号 ${displayPhone(phone)}${item.name ? "（" + item.name + "）" : ""}，监控端正在发验证码（最多 1 分钟）。\n收到验证码后发给我：/code <验证码>\n\n注意：验证码和二级密码只经过机器人中转，监控端收到就用、用完就删，不会存下来。`, true); ctx.waitUntil(sendWakeup(env)); } else { await answerCallback(env, cb.id, "这个添加已经处理过了"); } return; }
-if (data.startsWith("onboard:qr:")) { const phone = normalizePhone(data.slice("onboard:qr:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item && item.state === "choose_method") { item.mode = "qr"; item.state = "qr_pending"; await saveOnboard(env, onboard); await answerCallback(env, cb.id, "扫码登录"); await sendMessage(env, cb.message.chat.id, `📷 扫码登录【${displayPhone(phone)}】\n需要两个设备：一台显示二维码、一台扫码。\n二维码 30 秒有效，过期自动刷新（最多 10 次）。\n监控端马上发二维码，请用这个账号的 Telegram 扫（设置 → 设备 → 链接桌面设备）。\n取消：点二维码下的「停止扫码登录」，或发 /cancel_add ${displayPhone(phone)}`, true); ctx.waitUntil(sendWakeup(env)); } else { await answerCallback(env, cb.id, "这个添加已经处理过了"); } return; }
+if (data.startsWith("onboard:qr:")) { const phone = normalizePhone(data.slice("onboard:qr:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item && item.state === "choose_method") { item.mode = "qr"; item.state = "qr_pending"; await saveOnboard(env, onboard); await answerCallback(env, cb.id, "扫码登录"); await sendMessage(env, cb.message.chat.id, `📷 扫码登录【${displayPhone(phone)}】\n需要两个设备：一台显示二维码、一台扫码。\n二维码 30 秒有效，过期自动刷新（最多 10 次）。\n监控端马上发二维码，请用这个账号的 Telegram 扫（设置 → 设备 → 链接桌面设备）。\n取消：点二维码下的「停止扫码登录」，或发 /cancel_add ${displayPhone(phone)}`, true); ctx.waitUntil(sendWakeup(env, `onboard_qr:${phone}:${String(item.created_at || '').replace(/\D/g, '')}:${Math.floor(Date.now()/1000)}`)); } else { await answerCallback(env, cb.id, "这个添加已经处理过了"); } return; }
 const cmd = data.startsWith("cmd:")? data.slice(4): data;
 await answerCallback(env, cb.id);
 await runCommand(env, cb.message.chat.id, cb.from.id, cmd, ctx);
