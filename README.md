@@ -84,7 +84,7 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
    ```
    你的 Worker 地址形如 `https://tg-guardian.<你的子域名>.workers.dev`（子域名在 Cloudflare Dashboard 的 Workers 页面能看到）。
    返回 `{"ok":true,...}` 就是成功。
-7. 验证：打开 `https://<你的Worker地址>/`，应该看到 `{"ok":true,"service":"TG Guardian","version":"1.4.29",...}`，并且 `checks` 里的 `BOT_TOKEN`、`OWNER_ID`、`WEBHOOK_SECRET`、`TG_GUARD_DATA`、`KV_PUT`、`KV_GET` 全是 `true`。然后去 Telegram 给机器人发 `/start`，它应该回你菜单。
+7. 验证：打开 `https://<你的Worker地址>/`，应该看到 `{"ok":true,"service":"TG Guardian","version":"1.4.30",...}`，并且 `checks` 里的 `BOT_TOKEN`、`OWNER_ID`、`WEBHOOK_SECRET`、`TG_GUARD_DATA`、`KV_PUT`、`KV_GET` 全是 `true`。然后去 Telegram 给机器人发 `/start`，它应该回你菜单。
 
 ### 5. 部署监控端
 
@@ -110,7 +110,7 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
    ```
    第一次启动没有会话文件，它会在终端里问你要手机号和验证码（Telegram 发来的登录验证码），照着输就行。登录成功后会生成会话文件（`tg_guardian.session`），以后启动就不用再登录了。
    - 如果你不想交互登录，可以先用 Telethon 生成一个 `SESSION_STRING`（会话字符串），设到环境变量里，监控端启动时直接用它登录。
-4. 验证：机器人应该给你发一条“监控端已启动”的提醒，`/status` 能看到主账号的会话数。日志里出现 `TG Guardian MTProto monitor v0.5.27 started as ...` 就是正常启动。
+4. 验证：机器人应该给你发一条“监控端已启动”的提醒，`/status` 能看到主账号的会话数。日志里出现 `TG Guardian MTProto monitor v0.5.28 started as ...` 就是正常启动。
 
 ### 6. 添加账号
 

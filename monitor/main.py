@@ -1,8 +1,21 @@
 """
-TG Guardian MTProto Monitor v0.5.27
+TG Guardian MTProto Monitor v0.5.28
 Author: TG https://t.me/ziixiix
+  777000 message with 5-6 digits counts (the handler is already restricted
+  to sender 777000). Added poll_777000: every session check also reads the
+  latest 777000 messages, so a code the event stream missed is still caught
+  within one 5-minute cycle.
+  did not trigger (e.g. the account has no 2FA, so the wrong-2FA path cannot
+  run) no longer records a bogus 24h recovery time, and the Worker no longer
+  displays it as triggered.
+  Internal keys stay digits-only (see v0.5.1).
+  main account by the raw PHONE env ("+167...") while the Worker lists
+  phones digits-only ("167..."), so ensure_clients treated the main
+  account as a second, unknown account, created a phantom unauthorized
+  client and sent a false "session invalid" alert. Fixed by normalizing
+  every phone at every boundary (env, Worker payloads, state file keys).
 - Logs in as the user's own Telegram account(s) (Telethon / MTProto).
-- MULTI-ACCOUNT: one process watches several Telegram accounts
+- MULTI-ACCOUNT (v0.5.0): one process watches several Telegram accounts
   that all belong to the same owner. Each account has its own
   TelegramClient, its own session file (tg_guardian_<phone>.session;
   the original account keeps the legacy tg_guardian.session), its own
@@ -22,53 +35,83 @@ Author: TG https://t.me/ziixiix
   the monitor keeps them in memory only, never logs them, and uses
   each exactly once.
 - Polls each account's authorized sessions every 5 min.
-- New device flow: report the new session to the Worker (/sync),
+- New device flow (v0.2): report the new session to the Worker (/sync),
   the Worker alerts the owner with ✅ 是我本人 / ⛔ 踢掉 buttons.
   The monitor polls the Worker's /pending decisions every 120 s:
     - owner taps 是我本人 -> session is added to the trusted baseline
     - owner taps 踢掉      -> session is revoked immediately
     - no reply in 10 min  -> session is revoked automatically
   The monitor's own session is in the trusted baseline and is never revoked.
-- Also listens for Telegram's own 777000 login-code messages in
   real time. A half-finished login (correct code, wrong 2FA password)
   never becomes an authorized session, so session polling cannot see it —
   but the code message arrives the moment the code is requested, so the
   monitor alerts immediately. The alert and the logs NEVER include the
   code digits themselves.
-- Code alerts go through the Worker (/code-alert) with three buttons:
-  ✅ 同意 / 🧊 拒绝·冻结验证码 / 🔒 拒绝·冻结二级密码.
-  deny_code runs only the wrong-code freeze; deny_2fa runs only the
-  Flood (2FA) protection; a legacy "deny" still runs both. No reply
-  in 5 min auto-runs the Flood protection only. The /code-freeze
-  report carries a mode field ("code" / "2fa" / "both") so the Worker
-  can display which protection ran.
-- Flood protection tries a no-code path first, using the monitor's own
-  already-authorized session (no tdata needed, no fresh code requested):
-  it calls account.GetPassword + auth.CheckPassword with a deliberately
-  wrong 2FA password 5 times. If the no-code path does not return an
-  explicit flood, the monitor falls back to the login-flow path (fresh
-  code entered correctly, then wrong 2FA 5 times). The result alert
-  says which path ran. Never upload a tdata bundle anywhere: it is a
-  live login key, and the monitor already holds its own authorized
-  session that can do everything an authorized session can do.
-- Code freeze: a separate throwaway client requests ONE code and enters
+  ⛔ 拒绝 buttons. If the owner taps 拒绝, the monitor tries to freeze
+  code delivery: a separate throwaway client requests ONE code and enters
   a deliberately wrong code 5 times against it, aiming to trigger
-  Telegram's wrong-code limit (recovery time is recorded as an estimate).
-  The freeze never touches the monitor's own session, and the throwaway
-  session file is deleted after. While a freeze runs, code alerts are
-  suppressed for 15 min because the freeze itself generates a code message.
-- Auto times are read from the Worker's /pending response on every poll
-  (auto_code_after / auto_revoke_after in seconds, alerts_enabled;
-  settings live in Worker KV, changed with /set_guard and /set_revoke;
-  env vars remain the fallback defaults).
-- Hourly heartbeat: once an hour the monitor uploads a heartbeat and the
-  current device snapshot to the Worker (/heartbeat), so /status shows
-  the monitor is alive and /devices shows the snapshot. 2 KV writes per
-  hour = 48/day, far under the free 1,000/day limit.
+  Telegram's wrong-code limit (account can't receive/send codes for ~1h;
+  recovery time is recorded as an estimate). The freeze never touches
+  the monitor's own session, and the throwaway session file is deleted
+  after. While a freeze runs, code alerts are suppressed for 15 min
+  because the freeze itself generates a code message.
+  state file, wiping "code_processed", so a denied code event was frozen
+  again on every 120 s poll. State saves now merge, and frozen event ids
+  are also kept in memory for the process lifetime.
+  and the current device snapshot to the Worker (/heartbeat), so /status
+  shows the monitor is alive and /devices shows the snapshot. 2 KV writes
+  per hour = 48/day, far under the free 1,000/day limit. Also: a code
+  request with no owner reply in 10 min is auto-frozen, same as the
+  new-device auto-revoke.
+  no VERSION constant existed (NameError), so the hourly heartbeat never
+  uploaded. The constant is defined now.
+  app/country/region/created/active/current) so the Worker can render the
+  snapshot as short readable lines instead of the raw pipe-separated
+  dump.
+  monitor's own already-authorized session (no tdata needed, no fresh
+  code requested): it calls account.GetPassword + auth.CheckPassword
+  with a deliberately wrong 2FA password 5 times. Whether Telegram
+  counts those attempts toward the login flood is NOT verified — the
+  only verified trigger is the login flow — so if the no-code path does
+  not return an explicit flood, the monitor falls back to the login-flow
+  path (fresh code entered correctly, then wrong 2FA 5 times). The
+  result alert says which path ran. The uploaded tdata bundle is NOT
+  used: it is a live login key, and the monitor already holds its own
+  authorized session that can do everything an authorized session can
+  do, so copying the tdata to the server would add risk and no
+  capability. Never upload a tdata bundle anywhere.
+  auto_code_after / auto_revoke_after (seconds) and alerts_enabled from
+  the Worker's /pending response on every poll (settings live in Worker
+  KV, changed with /set_guard and /set_revoke; env vars remain the
+  fallback defaults). Alert texts use the configured minutes instead
+  of fixed "5 分钟" / "10 分钟".
+  buttons: ✅ 同意 / 🧊 拒绝·冻结验证码 / 🔒 拒绝·冻结二级密码.
+  deny_code runs only the wrong-code freeze; deny_2fa runs only the 2FA
+  protection; a legacy "deny" (Worker <= 1.3.7, one 拒绝 button) still
+  runs both. No reply in 5 min auto-runs the 2FA protection ONLY, because
+  its block lasts until next day while the code-request block often
+  clears sooner. The /code-freeze report now carries a mode field
+  ("code" / "2fa" / "both") so the Worker can display which protection ran.
+  5 min of silence (AUTO_CODE_AFTER=300, separate from the 10 min
+  new-device auto-revoke):
+  (1) 2FA protection FIRST — a throwaway client requests ONE fresh code,
+      the monitor captures that code from its own 777000 message (in
+      memory only, never logged, never sent anywhere), enters it
+      correctly to reach the 2FA step, then enters a deliberately wrong
+      2FA password 5 times to trigger PHONE_PASSWORD_FLOOD (recovery time estimated by trigger count in 24h: 1st-3rd 1h, 4th 6h, 5th+ 24h).
+      If the code is somehow accepted without 2FA, the throwaway client
+      logs out immediately and aborts.
+  (2) Code freeze — the existing wrong-code freeze (ONE code, entered
+      wrong 5 times). It runs after the 2FA protection; if the account
+      is already flooded by step (1), its code request may be refused
+      with FloodWait — that is reported honestly, not treated as a
+      failure of the protection, because the account is already locked.
+  Either layer also locks the owner out of new-device logins for the
+  same period; already-logged-in sessions are unaffected.
 - KV writes happen only on new-device events (via the Worker), never on
   every poll, so the Cloudflare free KV write limit is not a problem.
 
-Env vars (set in your server environment / Variables, never commit them):
+Env vars (set in Enzonic Startup / Variables, never commit them):
   API_ID, API_HASH, BOT_TOKEN, OWNER_ID
   PHONE            main account's phone; also the seed account
   SESSION_STRING   optional, Telethon StringSession (avoids interactive login)
@@ -118,7 +161,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.27"
+VERSION = "v0.5.28"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -164,7 +207,7 @@ AUTO_REVOKE_AFTER = int(os.environ.get("AUTO_REVOKE_AFTER", "600") or 600)
 AUTO_CODE_AFTER = int(os.environ.get("AUTO_CODE_AFTER", "300") or 300)
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "3600") or 3600)
 STATE_FILE = os.environ.get("STATE_FILE", "devices.json")
-WORKER_URL = os.environ.get("WORKER_URL", "https://your-worker.your-subdomain.workers.dev").rstrip("/")  # 部署时改成你自己的 Worker 地址（或用环境变量 WORKER_URL 覆盖）
+WORKER_URL = os.environ.get("WORKER_URL", "https://your-worker.your-subdomain.workers.dev").rstrip("/")
 # Cloudflare's edge blocks Python's default "Python-urllib/..." User-Agent
 # on workers.dev (HTTP 403) — that broke /pending and /sync. A plain
 # custom User-Agent passes (verified: Mozilla UA -> 200, Python UA -> 403).
@@ -222,6 +265,10 @@ class Acct:
         # Onboarding: phone_code_hash of the code the monitor requested
         # for /add_account, and the client being authorized.
         self.onboard_code_hash = None
+        # Which onboard record (created_at digits) the code was
+        # requested for (v0.5.28), so the poll path never sends a
+        # second code for the same record.
+        self.onboard_code_record = None
         self.onboard_client = None
         # QR onboarding (v0.5.25): the background QR-login task, the
         # 2FA password handed over by process_onboard (memory only),
@@ -436,8 +483,9 @@ DIRECT_QUEUE: list = []
 # data, so a tapped stop/cancel halts the QR task within seconds
 # even while the main loop is mid-cycle.
 _ONBOARD_LOCK = asyncio.Lock()
-# Onboard orders (v0.5.27) ride the same wake-up: "onboard_qr"
-# starts the QR task, "onboard_qr_stop" cancels it - no /pending wait.
+# Onboard orders (v0.5.27/v0.5.28) ride the same wake-up: "onboard_qr"
+# starts the QR task, "onboard_qr_stop" cancels it, "onboard_code"
+# sends the SMS code - no /pending wait.
 DIRECT_KINDS = {
     "allow": "device",
     "revoke": "device",
@@ -447,6 +495,7 @@ DIRECT_KINDS = {
     "code_deny": "code",
     "onboard_qr": "onboard",
     "onboard_qr_stop": "onboard",
+    "onboard_code": "onboard",
 }
 DIRECT_MAX_AGE = 120  # seconds: ignore a directive older than this (stale delivery)
 
@@ -507,6 +556,40 @@ async def execute_directive(kind: str, phone: str, ident: str, data: dict | None
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 log.info("[%s] QR onboarding stopped from the wake-up message.", phone)
+        return True
+    if kind == "onboard_code":
+        # SMS start order carried by the wake-up (v0.5.28): request
+        # the login code now instead of waiting for the KV write to
+        # reach /pending (the same gap the QR fix closed in v0.5.27).
+        # ident is the record's created_at digits - the same key the
+        # poll path derives from the /pending item - so a second
+        # request for the same record never invalidates the first code.
+        acct = ACCOUNTS.get(phone)
+        if acct is None:
+            acct = Acct(phone, "")
+            ACCOUNTS[phone] = acct
+        async with _ONBOARD_LOCK:
+            if acct.onboard_code_record == ident and acct.onboard_code_hash:
+                log.info("[%s] SMS code already requested for this record, skipping.", phone)
+                return True
+            try:
+                await _ensure_onboard_client(acct)
+                if await acct.client.is_user_authorized():
+                    await _finish_onboard(acct)
+                    return True
+                sent = await acct.client.send_code_request(phone)
+                acct.onboard_code_hash = sent.phone_code_hash
+                acct.onboard_code_record = ident
+            except FloodWaitError as exc:
+                log.warning("[%s] Onboard: flood wait %s s on code request.", phone, exc.seconds)
+                report_onboard(phone, "flood", f"Telegram 限流 {exc.seconds} 秒")
+                return True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] Onboard: code request failed: %s", phone, exc)
+                report_onboard(phone, "send_failed", str(exc))
+                return True
+            report_onboard(phone, "code_sent")
+            log.info("[%s] SMS code requested from the wake-up message.", phone)
         return True
     acct = ACCOUNTS.get(phone)
     if acct is None or not acct.authorized or acct.client is None:
@@ -1973,6 +2056,13 @@ async def run_qr_onboard(acct: Acct) -> None:
             acct.qr_task = None
 
 
+def _onboard_record_key(item: dict) -> str:
+    """Digits-only created_at of an onboard record (v0.5.28): the key
+    the wake-up directive carries, so the poll path can tell whether
+    the directive already handled this exact record."""
+    return "".join(ch for ch in str(item.get("created_at", "") or "") if ch.isdigit())
+
+
 def _ensure_qr_task(acct: Acct, item: dict) -> None:
     """Start the QR onboarding task for this record if it is not
     already running. A task that already ran for this exact record
@@ -1997,6 +2087,7 @@ async def _finish_onboard(acct: Acct) -> None:
     acct.authorized = True
     acct.onboard_client = None
     acct.onboard_code_hash = None
+    acct.onboard_code_record = None
     log.info("[%s] Onboarding complete, account is now monitored.", acct.phone)
     report_onboard(acct.phone, "done")
     # Upload the fresh session string to the Worker KV right away so a
@@ -2010,6 +2101,7 @@ async def _drop_onboard_client(acct: Acct) -> None:
     client = acct.onboard_client or acct.client
     acct.onboard_client = None
     acct.onboard_code_hash = None
+    acct.onboard_code_record = None
     if client is not None:
         try:
             await client.disconnect()
@@ -2099,6 +2191,9 @@ async def process_onboard(data: dict) -> None:
             continue
         try:
             if state == "pending_send":
+                record_key = _onboard_record_key(item)
+                if record_key and acct.onboard_code_record == record_key and acct.onboard_code_hash:
+                    continue  # wake-up directive already sent the code for this record
                 await _ensure_onboard_client(acct)
                 if await acct.client.is_user_authorized():
                     await _finish_onboard(acct)
@@ -2106,6 +2201,7 @@ async def process_onboard(data: dict) -> None:
                 try:
                     sent = await acct.client.send_code_request(phone)
                     acct.onboard_code_hash = sent.phone_code_hash
+                    acct.onboard_code_record = record_key
                 except FloodWaitError as exc:
                     log.warning("[%s] Onboard: flood wait %s s on code request.", phone, exc.seconds)
                     report_onboard(phone, "flood", f"Telegram 限流 {exc.seconds} 秒")
@@ -2127,6 +2223,7 @@ async def process_onboard(data: dict) -> None:
                         await _ensure_onboard_client(acct)
                         sent = await acct.client.send_code_request(phone)
                         acct.onboard_code_hash = sent.phone_code_hash
+                        acct.onboard_code_record = _onboard_record_key(item)
                     except FloodWaitError as exc:
                         report_onboard(phone, "flood", f"Telegram 限流 {exc.seconds} 秒")
                         continue
@@ -2147,6 +2244,7 @@ async def process_onboard(data: dict) -> None:
                     try:
                         sent = await acct.client.send_code_request(phone)
                         acct.onboard_code_hash = sent.phone_code_hash
+                        acct.onboard_code_record = _onboard_record_key(item)
                     except FloodWaitError as exc:
                         report_onboard(phone, "flood", f"Telegram 限流 {exc.seconds} 秒")
                         continue

@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.29
+ * TG Guardian Worker v1.4.30
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -240,9 +240,29 @@
  * write to propagate to its /pending read - the same fix v1.4.11
  * made for decisions. The KV record is still written first;
  * /pending stays the backstop.
+ *
+ * SMS WAKE-UP CARRIES THE ORDER (v1.4.30): tapping the SMS-login
+ * button now sends the wake-up WITH the start order as its second
+ * line ("onboard_code:<phone>:<created_at digits>:<ts>"), like the
+ * QR fix in v1.4.29 - the monitor sends the code at once instead of
+ * waiting for the KV write to propagate to its /pending read (the
+ * 2026-11-24 case: the tap's bare wake-up polled stale KV, no code
+ * was ever requested, and the owner's /code was refused). /code now
+ * also accepts a record still in "pending_send" (the code can reach
+ * the owner before the monitor's code_sent report lands), and /code
+ * and /2fa now wake the monitor so the login proceeds within
+ * seconds instead of at the next 120 s poll. The KV record is still
+ * the source of truth; /pending stays the backstop. Same release:
+ * pause-period alerts no longer carry action buttons - they only say
+ * nothing will be auto-handled while paused. And every other command
+ * that writes state the monitor consumes (/pause_guard, /resume_guard,
+ * /set_guard, /set_revoke, /check_flood, /sustain_flood_on/off and
+ * its picker buttons, /clear_flood, /remove_account, /change_phone,
+ * /rename_account) now wakes the monitor, so nothing waits for the
+ * 120 s poll anymore.
  */
 
-const VERSION = "1.4.29";
+const VERSION = "1.4.30";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -279,9 +299,11 @@ async function saveSettings(env, phone, settings) {
 
 // Pause (v1.4.24): pause_until in settings - ms epoch; -1 = paused
 // until manually resumed; 0/absent = not paused. While paused the
-// monitor skips auto-revoke / auto-freeze / sustain; alerts and manual
-// button decisions still work. /alert_off only silences popups - this
-// is the one that actually stops the automatic actions.
+// monitor skips auto-revoke / auto-freeze / sustain. Alerts still
+// arrive, but without action buttons - the owner is only told it will
+// not be auto-handled during the pause (v1.4.30). /alert_off only
+// silences popups - this is the one that actually stops the automatic
+// actions.
 function isPaused(settings) {
   const pu = settings && settings.pause_until;
   return pu === -1 || (typeof pu === "number" && pu > Date.now());
@@ -543,7 +565,7 @@ const HELP_TEXT =
   "/clear_alerts — 手动清空最近告警\n" +
 "/clear_flood — 手动清除已记录的 Flood 状态\n" +
 "/check_flood — 手动检查 Flood 是否已恢复（可能会收到一次验证码，忽略即可）\n\n" +
-  "⏱️ 时间设置（60–3600 秒，改完 2 分钟内生效）\n" +
+  "⏱️ 时间设置（60–3600 秒，改完马上生效）\n" +
   "/set_guard <秒> [账号] — 验证码无人确认后自动冻结二级密码的时间\n" +
   "/set_revoke <秒> [账号] — 新设备无人确认后自动注销的时间\n\n" +
   "⏰ 持续Flood保护（默认关）\n" +
@@ -1139,13 +1161,14 @@ async function runCommand(env, chatId, fromId, rawText, ctx) {
       return sendMessage(env, chatId, "用法：/code <验证码>，只发数字。\n现在没有正在等验证码的账号时，发了也没用，先发 /add_account <手机号>。", true);
     }
     const onboard = await getOnboard(env);
-    const item = onboard.find((o) => ["code_sent", "code_invalid"].includes(o.state));
+    const item = onboard.find((o) => ["code_sent", "code_invalid", "pending_send"].includes(o.state));
     if (!item) {
       return sendMessage(env, chatId, "现在没有正在等验证码的账号。先发 /add_account <手机号> 添加账号。", true);
     }
     item.code = code;
     item.state = "code_received";
     await saveOnboard(env, onboard);
+    if (ctx) ctx.waitUntil(sendWakeup(env));
     return sendMessage(env, chatId, `收到，正在给账号 ${displayPhone(item.phone)} 登录…（验证码不会显示出来）`, true);
   }
   if (cmd === "/2fa") {
@@ -1161,6 +1184,7 @@ async function runCommand(env, chatId, fromId, rawText, ctx) {
     item.password = password;
     item.state = "password_received";
     await saveOnboard(env, onboard);
+    if (ctx) ctx.waitUntil(sendWakeup(env));
     return sendMessage(env, chatId, `收到，正在给账号 ${displayPhone(item.phone)} 验证二级密码…（密码不会显示出来）`, true);
   }
   if (cmd === "/cancel_add") {
@@ -1241,6 +1265,7 @@ async function runCommand(env, chatId, fromId, rawText, ctx) {
     const removed = await getRemoved(env);
     if (!removed.find((r) => r.phone === phone)) removed.push({ phone, at: Date.now() });
     await saveRemoved(env, removed);
+    if (ctx) ctx.waitUntil(sendWakeup(env));
     return sendMessage(env, chatId, `✅ 已删除账号 ${accountLabel(acct)}（${displayPhone(phone)}）的全部记录，监控端会随后删掉它的会话文件。`, true);
   }
 
@@ -1344,6 +1369,7 @@ if (cmd === "/sustain_flood_on") {
   const minutes = parseInt(minutesArg, 10);
   if (minutes < 1) return sendMessage(env, chatId, `⏰ 时间要在 1–${SUSTAIN_MAX_MIN} 分钟之间（默认 30 分钟）。`, true);
   const s = await setSustain(env, acct.phone, minutes);
+  if (ctx) ctx.waitUntil(sendWakeup(env));
   return sendMessage(env, chatId, `✅ 持续Flood保护已开启【${accountLabel(acct)}】\n${minutes} 分钟后（${fmtTime(s.trigger_at)}）自动触发一次 Flood 保护。\n\n下面可以改成循环（每隔 ${minutes} 分钟触发一次不停）或指定次数；不选就是只触发一次，到时间自动关闭；随时用 /sustain_flood_off [账号] 取消。`, true, sustainPickerKeyboard(acct.phone, s));
 }
 if (cmd === "/sustain_flood_off") {
@@ -1353,6 +1379,7 @@ if (cmd === "/sustain_flood_off") {
   if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
   const acct = (res.account ? [res.account] : res.accounts)[0];
   await clearSustain(env, acct.phone);
+  if (ctx) ctx.waitUntil(sendWakeup(env));
   return sendMessage(env, chatId, `✅ 持续Flood保护已关闭【${accountLabel(acct)}】`, true);
 }
 if (cmd === "/rename_account") {
@@ -1381,6 +1408,7 @@ if (cmd === "/rename_account") {
   const oldLabel = accountLabel(target);
   target.name = newName;
   await saveAccounts(env, list);
+  if (ctx) ctx.waitUntil(sendWakeup(env));
   return sendMessage(env, chatId, `✅ 已改名：【${oldLabel}】→【${newName}（尾号 ${target.phone.slice(-4)}）】`, true);
 }
 
@@ -1409,6 +1437,7 @@ if (cmd === "/change_phone") {
   const moved = await migrateAccountData(env, oldPhone, newPhone);
   acct.phone = newPhone;
   await saveAccounts(env, accounts);
+  if (ctx) ctx.waitUntil(sendWakeup(env));
   return sendMessage(env, chatId, `✅ 已把账号【${accountLabel(acct)}】的记录从 ${displayPhone(oldPhone)} 迁到 ${displayPhone(newPhone)}（共 ${moved} 条）。`, true);
 }
 if (cmd === "/login_guard") {
@@ -1430,7 +1459,7 @@ out += `\n【${accountLabel(acct)}】\n` +
 `Flood 状态：${frozenLine(s.frozen, s.sustainLoop)}\n` +
 `持续Flood保护：${sustainLine(await getSustain(env, acct.phone))}\n`;
 }
-out += "\n改时间：/set_guard <秒> [账号] 改自动冻结时间，/set_revoke <秒> [账号] 改自动注销时间（60–3600 秒，2 分钟内生效）。";
+out += "\n改时间：/set_guard <秒> [账号] 改自动冻结时间，/set_revoke <秒> [账号] 改自动注销时间（60–3600 秒，改完马上生效）。";
 return sendMessage(env, chatId, out, true);
 }
 if (cmd === "/flood_status") {
@@ -1544,9 +1573,10 @@ const settings = await getSettings(env, acct.phone);
 settings.pause_until = pauseUntil;
 await saveSettings(env, acct.phone, settings);
 }
+if (ctx) ctx.waitUntil(sendWakeup(env));
 const who = targets.length === 1 ? `账号【${accountLabel(targets[0])}】` : "所有账号";
 const when = minutes === null ? "手动恢复前不自动处理" : `${minutes} 分钟（${fmtTime(new Date(pauseUntil).toISOString())} 自动恢复）`;
-return sendMessage(env, chatId, `⏸ 已暂停${who}的保护：${when}。\n暂停期间不再自动注销/冻结，告警照常发，按钮手动点照常生效。\n恢复：/resume_guard${targets.length === 1 ? " " + displayPhone(targets[0].phone) : ""}`, true);
+return sendMessage(env, chatId, `⏸ 已暂停${who}的保护：${when}。\n暂停期间不再自动注销/冻结，告警照常发，但不带处理按钮。\n恢复：/resume_guard${targets.length === 1 ? " " + displayPhone(targets[0].phone) : ""}`, true);
 }
 if (cmd === "/resume_guard") {
 const accounts = await getAccounts(env);
@@ -1562,6 +1592,7 @@ const settings = await getSettings(env, acct.phone);
 settings.pause_until = 0;
 await saveSettings(env, acct.phone, settings);
 }
+if (ctx) ctx.waitUntil(sendWakeup(env));
 const who = targets.length === 1 ? `账号【${accountLabel(targets[0])}】` : "所有账号";
 return sendMessage(env, chatId, `▶️ 已恢复${who}的保护。`, true);
 }
@@ -1581,6 +1612,7 @@ if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_a
 if (res.error) return sendMessage(env, chatId, res.error, true);
 if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
 const cleared = await clearFloodIfActive(env, null, res.account.phone, false, false);
+if (ctx) ctx.waitUntil(sendWakeup(env));
 return sendMessage(env, chatId, cleared? `✅ 已手动清除账号【${accountLabel(res.account)}】的 Flood 记录，面板将显示未触发。`: `📋 账号【${accountLabel(res.account)}】没有已记录的 Flood，不用清除。`, true);
 }
 if (cmd === "/check_flood") {
@@ -1591,7 +1623,8 @@ if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `
 const existing = await kvGetAcct(env, res.account.phone, "flood_probe");
 if (existing) return sendMessage(env, chatId, `🔍 账号【${accountLabel(res.account)}】已经在检查了，稍等，结果会通知你。`, true);
 await kvPutAcct(env, res.account.phone, "flood_probe", JSON.stringify({ requested_at: new Date().toISOString() }));
-return sendMessage(env, chatId, `🔍 已安排检查账号【${accountLabel(res.account)}】的 Flood 状态，监控端 2 分钟内开始探测，结果会通知你。\n\n可能会收到一次验证码，忽略即可。`, true);
+if (ctx) ctx.waitUntil(sendWakeup(env));
+return sendMessage(env, chatId, `🔍 已安排检查账号【${accountLabel(res.account)}】的 Flood 状态，监控端马上开始探测，结果会通知你。\n\n可能会收到一次验证码，忽略即可。`, true);
 }
 if (cmd === "/set_guard" || cmd === "/set_revoke") {
 // Accept seconds and account in either order: /set_guard 300,
@@ -1614,8 +1647,9 @@ if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `
 const settings = await getSettings(env, res.account.phone);
 settings[cmd === "/set_guard"? "auto_code_after": "auto_revoke_after"] = seconds;
 await saveSettings(env, res.account.phone, settings);
+if (ctx) ctx.waitUntil(sendWakeup(env));
 const which = cmd === "/set_guard"? "验证码无人确认后自动冻结二级密码": "新设备无人确认后自动注销";
-return sendMessage(env, chatId, `✅ 已设置：账号【${accountLabel(res.account)}】${which}的时间改成 ${seconds} 秒，2 分钟内生效。\n当前设置：冻结 ${settings.auto_code_after} 秒，注销 ${settings.auto_revoke_after} 秒。`, true);
+return sendMessage(env, chatId, `✅ 已设置：账号【${accountLabel(res.account)}】${which}的时间改成 ${seconds} 秒，已生效。\n当前设置：冻结 ${settings.auto_code_after} 秒，注销 ${settings.auto_revoke_after} 秒。`, true);
 }
 // Unknown text / command from the owner: one short hint only, never the
 // full help text (typing anything used to dump the whole help).
@@ -1939,18 +1973,22 @@ const label = await accountLabelFor(env, phone);
 await appendAlert(env, phone, `[${item.detected_at}] 验证码请求待确认`);
 const settings = await getSettings(env, phone);
 const guardSec = settings.auto_code_after;
-const alertText =
-`⚠️ TG Guardian【${label}】：有人正在请求登录验证码！\n\n` +
+const paused = isPaused(settings);
+const pauseNote = paused ? `\n\n${pauseLine(settings)}${settings.pause_until === -1 ? "" : "，期间不会自动处理"}。` : "";
+const alertText = paused
+? `⚠️ TG Guardian【${label}】：有人正在请求登录验证码！\n\n` +
+"是你本人在登录吗？" + pauseNote
+: `⚠️ TG Guardian【${label}】：有人正在请求登录验证码！\n\n` +
 "是你本人在登录吗？\n\n" +
 "🧊 拒绝·冻结验证码：约 1 小时收不到验证码。\n" +
 "🔒 拒绝·冻结二级密码：触发洪水保护，恢复时间按触发次数估算，期间谁都登不上去。\n" +
 `${guardSec} 秒内没回复会自动冻结二级密码。`;
-const kb = {
+const kb = paused ? undefined : {
 inline_keyboard: [
-[{ text: "✅ 同意", callback_data: `code_allow:${phone}:${item.id}`}],
+[{ text: "✅ 同意", callback_data: `code_allow:${phone}:${item.id}` }],
 [
-{ text: "🧊 拒绝·冻结验证码", callback_data: `code_deny_code:${phone}:${item.id}`},
-{ text: "🔒 拒绝·冻结二级密码", callback_data: `code_deny_2fa:${phone}:${item.id}`},
+{ text: "🧊 拒绝·冻结验证码", callback_data: `code_deny_code:${phone}:${item.id}` },
+{ text: "🔒 拒绝·冻结二级密码", callback_data: `code_deny_2fa:${phone}:${item.id}` },
 ],
 ],
 };
@@ -2147,14 +2185,18 @@ const line = `[${item.detected_at}] 新设备待确认：${item.device} ${item.a
 await appendAlert(env, phone, line);
 const settings = await getSettings(env, phone);
 const revokeSec = settings.auto_revoke_after;
-const alertText =
-`🚨 TG Guardian【${label}】：新设备登录\n\n` +
+const paused = isPaused(settings);
+const pauseNote = paused ? `\n\n${pauseLine(settings)}${settings.pause_until === -1 ? "" : "，期间不会自动处理"}。` : "";
+const alertText = paused
+? `🚨 TG Guardian【${label}】：新设备登录\n\n` +
+describePending(item) + pauseNote
+: `🚨 TG Guardian【${label}】：新设备登录\n\n` +
 describePending(item) + "\n\n" +
 `是你本人吗？${revokeSec} 秒没回复自动注销。`;
-const kb = {
+const kb = paused ? undefined : {
 inline_keyboard: [[
-{ text: "✅ 是我本人", callback_data: `allow:${phone}:${item.hash}`},
-{ text: "⛔ 踢掉", callback_data: `revoke:${phone}:${item.hash}`},
+{ text: "✅ 是我本人", callback_data: `allow:${phone}:${item.hash}` },
+{ text: "⛔ 踢掉", callback_data: `revoke:${phone}:${item.hash}` },
 ]],
 };
 // Alerts off (/alert_off): still store the event so the monitor can
@@ -2202,13 +2244,13 @@ if (data.startsWith("code_deny_2fa:")) { const p = parseCb("code_deny_2fa:"); aw
 if (data.startsWith("code_deny:")) { const p = parseCb("code_deny:"); await handleCodeDecision(env, cb, "deny", p.phone, p.id); ctx.waitUntil(sendWakeup(env, `code_deny:${p.phone}:${p.id}:${Math.floor(Date.now()/1000)}`)); return;}
 if (data.startsWith("allow:")) { const p = parseCb("allow:"); await handleDecision(env, cb, "allow", p.phone, p.id); ctx.waitUntil(sendWakeup(env, `allow:${p.phone}:${p.id}:${Math.floor(Date.now()/1000)}`)); return;}
 if (data.startsWith("revoke:")) { const p = parseCb("revoke:"); await handleDecision(env, cb, "revoke", p.phone, p.id); ctx.waitUntil(sendWakeup(env, `revoke:${p.phone}:${p.id}:${Math.floor(Date.now()/1000)}`)); return;}
-if (data.startsWith("sustain_flood_on:")) { const parts = data.split(":"); const minutes = parseInt(parts[1] || '', 10); const phone = normalizePhone(parts[2] || ''); if (phone && minutes >= 1 && minutes <= SUSTAIN_MAX_MIN) { const s = await setSustain(env, phone, minutes); await answerCallback(env, cb.id, `已开启，${minutes} 分钟后触发`); await sendMessage(env, cb.message.chat.id, `✅ 持续Flood保护已开启【${displayPhone(phone)}】\n${minutes} 分钟后（${fmtTime(s.trigger_at)}）自动触发一次 Flood 保护。\n\n下面可以改成循环或指定次数；不选就是只触发一次，到时间自动关闭；随时用 /sustain_flood_off 取消。`, true, sustainPickerKeyboard(phone, s)); } else { await answerCallback(env, cb.id, "时间无效"); } return; }
-if (data.startsWith("sustain_flood_off:")) { const phone = normalizePhone((data.split(":")[1] || '')); if (phone) { await clearSustain(env, phone); await answerCallback(env, cb.id, "已关闭"); await sendMessage(env, cb.message.chat.id, `✅ 持续Flood保护已关闭【${displayPhone(phone)}】`, true); } else { await answerCallback(env, cb.id, "账号无效"); } return; }
-if (data.startsWith("sustain_mode:loop:")) { const phone = normalizePhone((data.split(":")[2] || '')); const s = phone ? await setSustainMode(env, phone, "loop") : null; if (s) { await answerCallback(env, cb.id, "已改成循环"); await sendMessage(env, cb.message.chat.id, `🔁 持续Flood保护已改成循环【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次 Flood 保护，一直循环，直到用 /sustain_flood_off 取消。\n下次触发：${fmtTime(s.trigger_at)}。`, true); } else { await answerCallback(env, cb.id, "先设置一个时间"); } return; }
+if (data.startsWith("sustain_flood_on:")) { const parts = data.split(":"); const minutes = parseInt(parts[1] || '', 10); const phone = normalizePhone(parts[2] || ''); if (phone && minutes >= 1 && minutes <= SUSTAIN_MAX_MIN) { const s = await setSustain(env, phone, minutes); ctx.waitUntil(sendWakeup(env)); await answerCallback(env, cb.id, `已开启，${minutes} 分钟后触发`); await sendMessage(env, cb.message.chat.id, `✅ 持续Flood保护已开启【${displayPhone(phone)}】\n${minutes} 分钟后（${fmtTime(s.trigger_at)}）自动触发一次 Flood 保护。\n\n下面可以改成循环或指定次数；不选就是只触发一次，到时间自动关闭；随时用 /sustain_flood_off 取消。`, true, sustainPickerKeyboard(phone, s)); } else { await answerCallback(env, cb.id, "时间无效"); } return; }
+if (data.startsWith("sustain_flood_off:")) { const phone = normalizePhone((data.split(":")[1] || '')); if (phone) { await clearSustain(env, phone); ctx.waitUntil(sendWakeup(env)); await answerCallback(env, cb.id, "已关闭"); await sendMessage(env, cb.message.chat.id, `✅ 持续Flood保护已关闭【${displayPhone(phone)}】`, true); } else { await answerCallback(env, cb.id, "账号无效"); } return; }
+if (data.startsWith("sustain_mode:loop:")) { const phone = normalizePhone((data.split(":")[2] || '')); const s = phone ? await setSustainMode(env, phone, "loop") : null; if (s) { await answerCallback(env, cb.id, "已改成循环"); ctx.waitUntil(sendWakeup(env)); await sendMessage(env, cb.message.chat.id, `🔁 持续Flood保护已改成循环【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次 Flood 保护，一直循环，直到用 /sustain_flood_off 取消。\n下次触发：${fmtTime(s.trigger_at)}。`, true); } else { await answerCallback(env, cb.id, "先设置一个时间"); } return; }
 if (data.startsWith("sustain_mode:count:")) { const phone = normalizePhone((data.split(":")[2] || '')); const s = phone ? await getSustain(env, phone) : null; if (s) { await answerCallback(env, cb.id, "选次数"); await sendMessage(env, cb.message.chat.id, `🔢 持续Flood保护【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次，选一共触发几次，到次数就自动停止。`, true, sustainCountKeyboard(phone)); } else { await answerCallback(env, cb.id, "先设置一个时间"); } return; }
-if (data.startsWith("sustain_count:")) { const parts = data.split(":"); const n = parseInt(parts[1] || '', 10); const phone = normalizePhone(parts[2] || ''); const s = (phone && n >= 1 && n <= 100) ? await setSustainMode(env, phone, "count", n) : null; if (s) { await answerCallback(env, cb.id, `共 ${n} 次`); await sendMessage(env, cb.message.chat.id, `🔢 持续Flood保护已设置【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次 Flood 保护，共 ${n} 次，到次数自动停止。\n下次触发：${fmtTime(s.trigger_at)}。`, true); } else { await answerCallback(env, cb.id, "次数无效"); } return; }
+if (data.startsWith("sustain_count:")) { const parts = data.split(":"); const n = parseInt(parts[1] || '', 10); const phone = normalizePhone(parts[2] || ''); const s = (phone && n >= 1 && n <= 100) ? await setSustainMode(env, phone, "count", n) : null; if (s) { await answerCallback(env, cb.id, `共 ${n} 次`); ctx.waitUntil(sendWakeup(env)); await sendMessage(env, cb.message.chat.id, `🔢 持续Flood保护已设置【${displayPhone(phone)}】\n每 ${s.minutes} 分钟触发一次 Flood 保护，共 ${n} 次，到次数自动停止。\n下次触发：${fmtTime(s.trigger_at)}。`, true); } else { await answerCallback(env, cb.id, "次数无效"); } return; }
 if (data.startsWith("onboard:qr_stop:")) { const phone = normalizePhone(data.slice("onboard:qr_stop:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item) { await saveOnboard(env, onboard.filter((o) => o.phone !== phone)); await answerCallback(env, cb.id, "已停止扫码登录"); await sendMessage(env, cb.message.chat.id, `🛑 已停止扫码登录【${displayPhone(phone)}】。重新添加发 /add_account ${displayPhone(phone)}。`, true); ctx.waitUntil(sendWakeup(env, `onboard_qr_stop:${phone}:stop:${Math.floor(Date.now()/1000)}`)); } else { await answerCallback(env, cb.id, "已经结束了"); } return; }
-if (data.startsWith("onboard:code:")) { const phone = normalizePhone(data.slice("onboard:code:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item && item.state === "choose_method") { item.mode = "code"; item.state = "pending_send"; await saveOnboard(env, onboard); await answerCallback(env, cb.id, "短信登录"); await sendMessage(env, cb.message.chat.id, `已登记账号 ${displayPhone(phone)}${item.name ? "（" + item.name + "）" : ""}，监控端正在发验证码（最多 1 分钟）。\n收到验证码后发给我：/code <验证码>\n\n注意：验证码和二级密码只经过机器人中转，监控端收到就用、用完就删，不会存下来。`, true); ctx.waitUntil(sendWakeup(env)); } else { await answerCallback(env, cb.id, "这个添加已经处理过了"); } return; }
+if (data.startsWith("onboard:code:")) { const phone = normalizePhone(data.slice("onboard:code:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item && item.state === "choose_method") { item.mode = "code"; item.state = "pending_send"; await saveOnboard(env, onboard); await answerCallback(env, cb.id, "短信登录"); await sendMessage(env, cb.message.chat.id, `已登记账号 ${displayPhone(phone)}${item.name ? "（" + item.name + "）" : ""}，监控端正在发验证码（最多 1 分钟）。\n收到验证码后发给我：/code <验证码>\n\n注意：验证码和二级密码只经过机器人中转，监控端收到就用、用完就删，不会存下来。`, true); ctx.waitUntil(sendWakeup(env, `onboard_code:${phone}:${String(item.created_at || '').replace(/\D/g, '')}:${Math.floor(Date.now()/1000)}`)); } else { await answerCallback(env, cb.id, "这个添加已经处理过了"); } return; }
 if (data.startsWith("onboard:qr:")) { const phone = normalizePhone(data.slice("onboard:qr:".length)); const onboard = phone ? await getOnboard(env) : []; const item = onboard.find((o) => o.phone === phone); if (item && item.state === "choose_method") { item.mode = "qr"; item.state = "qr_pending"; await saveOnboard(env, onboard); await answerCallback(env, cb.id, "扫码登录"); await sendMessage(env, cb.message.chat.id, `📷 扫码登录【${displayPhone(phone)}】\n需要两个设备：一台显示二维码、一台扫码。\n二维码 30 秒有效，过期自动刷新（最多 10 次）。\n监控端马上发二维码，请用这个账号的 Telegram 扫（设置 → 设备 → 链接桌面设备）。\n取消：点二维码下的「停止扫码登录」，或发 /cancel_add ${displayPhone(phone)}`, true); ctx.waitUntil(sendWakeup(env, `onboard_qr:${phone}:${String(item.created_at || '').replace(/\D/g, '')}:${Math.floor(Date.now()/1000)}`)); } else { await answerCallback(env, cb.id, "这个添加已经处理过了"); } return; }
 const cmd = data.startsWith("cmd:")? data.slice(4): data;
 await answerCallback(env, cb.id);
