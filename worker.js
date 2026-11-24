@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.30
+ * TG Guardian Worker v1.4.31
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -260,9 +260,16 @@
  * its picker buttons, /clear_flood, /remove_account, /change_phone,
  * /rename_account) now wakes the monitor, so nothing waits for the
  * 120 s poll anymore.
+ *
+ * PAUSE ALERTS KEEP THEIR BUTTONS (v1.4.31): v1.4.30 made pause-
+ * period alerts buttonless; the owner asked to revert that
+ * (2026-11-24) - alerts sent while paused carry their action
+ * buttons again so the owner can still act manually, and the note
+ * that nothing will be auto-handled while paused stays in place
+ * of the auto-act countdown.
  */
 
-const VERSION = "1.4.30";
+const VERSION = "1.4.31";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -300,10 +307,11 @@ async function saveSettings(env, phone, settings) {
 // Pause (v1.4.24): pause_until in settings - ms epoch; -1 = paused
 // until manually resumed; 0/absent = not paused. While paused the
 // monitor skips auto-revoke / auto-freeze / sustain. Alerts still
-// arrive, but without action buttons - the owner is only told it will
-// not be auto-handled during the pause (v1.4.30). /alert_off only
-// silences popups - this is the one that actually stops the automatic
-// actions.
+// arrive with their action buttons and manual taps still work - only
+// the automatic actions are skipped (v1.4.30 briefly made pause
+// alerts buttonless; reverted in v1.4.31 at the owner's request).
+// /alert_off only silences popups - this is the one that actually
+// stops the automatic actions.
 function isPaused(settings) {
   const pu = settings && settings.pause_until;
   return pu === -1 || (typeof pu === "number" && pu > Date.now());
@@ -1576,7 +1584,7 @@ await saveSettings(env, acct.phone, settings);
 if (ctx) ctx.waitUntil(sendWakeup(env));
 const who = targets.length === 1 ? `账号【${accountLabel(targets[0])}】` : "所有账号";
 const when = minutes === null ? "手动恢复前不自动处理" : `${minutes} 分钟（${fmtTime(new Date(pauseUntil).toISOString())} 自动恢复）`;
-return sendMessage(env, chatId, `⏸ 已暂停${who}的保护：${when}。\n暂停期间不再自动注销/冻结，告警照常发，但不带处理按钮。\n恢复：/resume_guard${targets.length === 1 ? " " + displayPhone(targets[0].phone) : ""}`, true);
+return sendMessage(env, chatId, `⏸ 已暂停${who}的保护：${when}。\n暂停期间不再自动注销/冻结，告警照常发，按钮手动点照常生效。\n恢复：/resume_guard${targets.length === 1 ? " " + displayPhone(targets[0].phone) : ""}`, true);
 }
 if (cmd === "/resume_guard") {
 const accounts = await getAccounts(env);
@@ -1977,13 +1985,15 @@ const paused = isPaused(settings);
 const pauseNote = paused ? `\n\n${pauseLine(settings)}${settings.pause_until === -1 ? "" : "，期间不会自动处理"}。` : "";
 const alertText = paused
 ? `⚠️ TG Guardian【${label}】：有人正在请求登录验证码！\n\n` +
-"是你本人在登录吗？" + pauseNote
+"是你本人在登录吗？\n\n" +
+"🧊 拒绝·冻结验证码：约 1 小时收不到验证码。\n" +
+"🔒 拒绝·冻结二级密码：触发洪水保护，恢复时间按触发次数估算，期间谁都登不上去。" + pauseNote
 : `⚠️ TG Guardian【${label}】：有人正在请求登录验证码！\n\n` +
 "是你本人在登录吗？\n\n" +
 "🧊 拒绝·冻结验证码：约 1 小时收不到验证码。\n" +
 "🔒 拒绝·冻结二级密码：触发洪水保护，恢复时间按触发次数估算，期间谁都登不上去。\n" +
 `${guardSec} 秒内没回复会自动冻结二级密码。`;
-const kb = paused ? undefined : {
+const kb = {
 inline_keyboard: [
 [{ text: "✅ 同意", callback_data: `code_allow:${phone}:${item.id}` }],
 [
@@ -2189,11 +2199,11 @@ const paused = isPaused(settings);
 const pauseNote = paused ? `\n\n${pauseLine(settings)}${settings.pause_until === -1 ? "" : "，期间不会自动处理"}。` : "";
 const alertText = paused
 ? `🚨 TG Guardian【${label}】：新设备登录\n\n` +
-describePending(item) + pauseNote
+describePending(item) + "\n\n是你本人吗？" + pauseNote
 : `🚨 TG Guardian【${label}】：新设备登录\n\n` +
 describePending(item) + "\n\n" +
 `是你本人吗？${revokeSec} 秒没回复自动注销。`;
-const kb = paused ? undefined : {
+const kb = {
 inline_keyboard: [[
 { text: "✅ 是我本人", callback_data: `allow:${phone}:${item.hash}` },
 { text: "⛔ 踢掉", callback_data: `revoke:${phone}:${item.hash}` },

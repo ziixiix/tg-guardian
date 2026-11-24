@@ -84,7 +84,7 @@ Telegram 登录分两步：先请求验证码（发到你的 Telegram 应用内�
    ```
    你的 Worker 地址形如 `https://tg-guardian.<你的子域名>.workers.dev`（子域名在 Cloudflare Dashboard 的 Workers 页面能看到）。
    返回 `{"ok":true,...}` 就是成功。
-7. 验证：打开 `https://<你的Worker地址>/`，应该看到 `{"ok":true,"service":"TG Guardian","version":"1.4.30",...}`，并且 `checks` 里的 `BOT_TOKEN`、`OWNER_ID`、`WEBHOOK_SECRET`、`TG_GUARD_DATA`、`KV_PUT`、`KV_GET` 全是 `true`。然后去 Telegram 给机器人发 `/start`，它应该回你菜单。
+7. 验证：打开 `https://<你的Worker地址>/`，应该看到 `{"ok":true,"service":"TG Guardian","version":"1.4.31",...}`，并且 `checks` 里的 `BOT_TOKEN`、`OWNER_ID`、`WEBHOOK_SECRET`、`TG_GUARD_DATA`、`KV_PUT`、`KV_GET` 全是 `true`。然后去 Telegram 给机器人发 `/start`，它应该回你菜单。
 
 ### 5. 部署监控端
 
