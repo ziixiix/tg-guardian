@@ -1,5 +1,5 @@
 """
-TG Guardian MTProto Monitor v0.5.28
+TG Guardian MTProto Monitor v0.5.29
 Author: TG https://t.me/ziixiix
   777000 message with 5-6 digits counts (the handler is already restricted
   to sender 777000). Added poll_777000: every session check also reads the
@@ -161,7 +161,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.28"
+VERSION = "v0.5.29"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -292,6 +292,10 @@ class Acct:
         # Pause (v0.5.24): whether protection was paused on the last
         # poll, so a timed pause expiring can be announced once.
         self.was_paused = False
+        # Pause (v0.5.29): the resume-rebase consumer's own view of
+        # the paused state, kept separate from was_paused (which
+        # belongs to check_pause_expiry's announcement logic).
+        self.was_paused_rebase = False
 
     @property
     def label(self) -> str:
@@ -1492,6 +1496,10 @@ async def apply_code_decision(acct: Acct, event_id: str, mode: str, auto: bool =
         result["expected_recovery_at"] = _resp["expected_recovery_at"]
         result["estimate_hours"] = _resp.get("estimate_hours") or 1
         result["flood_count"] = _resp.get("flood_count")
+    if mode in ("2fa", "both") and result.get("twofa_triggered"):
+        # Stamp the last real Flood trigger so a burst of overdue
+        # alerts cannot stack trigger counts (v0.5.29 coalescing).
+        save_account_state(acct.phone, {"last_flood_at": time.time()})
     processed.add(event_id)
     acct.freeze_done.add(event_id)
     save_account_state(acct.phone, {"code_processed": sorted(processed)})
@@ -1516,6 +1524,34 @@ async def apply_code_decision(acct: Acct, event_id: str, mode: str, auto: bool =
     return True
 
 
+# While protection is paused, the silence clocks keep running on
+# paper (they are measured from each alert's detected_at), so
+# without a rebase every alert raised during the pause would be
+# instantly overdue on resume and fire at once (v0.5.29). When an
+# auto Flood freeze already triggered for an account this many
+# seconds ago, further auto freezes are coalesced instead of
+# stacking trigger counts.
+AUTO_FLOOD_COALESCE_SECONDS = 600
+
+
+async def apply_resume_rebase(acct: Acct, data: dict) -> None:
+    """Stamp a fresh silence window for pre-resume alerts (v0.5.29).
+
+    On the paused -> unpaused transition, record rebase_at = now in
+    the account state. process_code_events and process_pending
+    measure silence from max(detected_at, rebase_at), so alerts
+    raised before the resume get a full fresh window (the owner can
+    still tap their buttons meanwhile) and alerts raised after it
+    are unaffected. Uses its own transition flag: check_pause_expiry
+    keeps was_paused for its timed-expiry announcement."""
+    per = per_account(data, acct.phone)
+    paused_now = _is_paused(settings_from(per))
+    if acct.was_paused_rebase and not paused_now:
+        save_account_state(acct.phone, {"rebase_at": time.time()})
+        log.warning("[%s] Protection resumed; pre-resume alerts get a fresh silence window.", acct.phone)
+    acct.was_paused_rebase = paused_now
+
+
 async def process_code_events(acct: Acct, data: dict) -> None:
     """Apply owner decisions on login-code alerts from the Worker."""
     per = per_account(data, acct.phone)
@@ -1528,6 +1564,8 @@ async def process_code_events(acct: Acct, data: dict) -> None:
     state = load_account_state(acct.phone)
     processed = set(state.get("code_processed", [])) | acct.freeze_done
     now = time.time()
+    rebase_at = float(state.get("rebase_at", 0) or 0)
+    last_flood_at = float(state.get("last_flood_at", 0) or 0)
     for ev in code_events:
         event_id = str(ev.get("id", ""))
         status = ev.get("status")
@@ -1542,10 +1580,21 @@ async def process_code_events(acct: Acct, data: dict) -> None:
                 detected = datetime.fromisoformat(
                     str(ev.get("detected_at", "")).replace("Z", "+00:00")
                 )
-                elapsed = now - detected.timestamp()
+                elapsed = now - max(detected.timestamp(), rebase_at)
             except ValueError:
                 elapsed = 0
             if not paused and elapsed >= auto_code_after:
+                if now - last_flood_at < AUTO_FLOOD_COALESCE_SECONDS:
+                    # A Flood freeze already triggered for this
+                    # account moments ago; another auto-run would
+                    # only inflate the trigger count and the
+                    # recovery estimate. The account is already
+                    # protected - consume the event quietly.
+                    log.warning("[%s] Code request %s: auto-freeze coalesced (Flood triggered %.0f s ago).", acct.phone, event_id, now - last_flood_at)
+                    processed.add(event_id)
+                    acct.freeze_done.add(event_id)
+                    save_account_state(acct.phone, {"code_processed": sorted(processed)})
+                    continue
                 mode = "2fa"
                 auto = True
                 log.warning("[%s] Code request %s unanswered for %d s; auto-freezing 2FA.",
@@ -1563,6 +1612,8 @@ async def process_code_events(acct: Acct, data: dict) -> None:
         if mode:
             if await apply_code_decision(acct, event_id, mode, auto, auto_code_after):
                 processed.add(event_id)
+                if auto:
+                    last_flood_at = float(load_account_state(acct.phone).get("last_flood_at", 0) or 0)
 
 
 async def probe_flood(acct: Acct) -> dict:
@@ -1868,6 +1919,7 @@ async def process_pending(acct: Acct, data: dict) -> None:
     """
     state = load_account_state(acct.phone)
     pending = state.get("pending", {})
+    rebase_at = float(state.get("rebase_at", 0) or 0)
     if not pending:
         return
     per = per_account(data, acct.phone)
@@ -1878,7 +1930,7 @@ async def process_pending(acct: Acct, data: dict) -> None:
     now = time.time()
     for h in list(pending):
         status = decisions.get(h, "pending")
-        elapsed = now - float(pending[h].get("detected_at", now))
+        elapsed = now - max(float(pending[h].get("detected_at", now)), rebase_at)
         if status == "allow":
             await apply_device_decision(acct, h, "allow", False, auto_revoke_after)
         elif status == "revoke" or (status == "pending" and not paused and elapsed >= auto_revoke_after):
@@ -2513,6 +2565,7 @@ async def main() -> None:
                     if now - acct.last_heartbeat >= HEARTBEAT_INTERVAL:
                         await upload_heartbeat(acct)
                         acct.last_heartbeat = time.time()
+                    await apply_resume_rebase(acct, data)
                     await process_pending(acct, data)
                     await process_code_events(acct, data)
                     await process_flood_probe(acct, data)
