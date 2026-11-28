@@ -1,5 +1,5 @@
 """
-TG Guardian MTProto Monitor v0.5.29
+TG Guardian MTProto Monitor v0.5.30
 Author: TG https://t.me/ziixiix
   777000 message with 5-6 digits counts (the handler is already restricted
   to sender 777000). Added poll_777000: every session check also reads the
@@ -161,7 +161,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-guardian-mtproto")
 
-VERSION = "v0.5.29"
+VERSION = "v0.5.30"
 
 def norm_phone(p) -> str:
     """Digits-only phone. The Worker normalizes phones to digits-only,
@@ -205,6 +205,7 @@ FAST_CHECK_INTERVAL = 3    # seconds between session checks while a code was jus
 FAST_CHECK_WINDOW = 300    # seconds of fast checking after a code alert
 AUTO_REVOKE_AFTER = int(os.environ.get("AUTO_REVOKE_AFTER", "600") or 600)
 AUTO_CODE_AFTER = int(os.environ.get("AUTO_CODE_AFTER", "300") or 300)
+RECONCILE_GRACE_SECONDS = 180  # KV device records younger than this stay with check_once/process_pending (v0.5.30)
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "3600") or 3600)
 STATE_FILE = os.environ.get("STATE_FILE", "devices.json")
 WORKER_URL = os.environ.get("WORKER_URL", "https://your-worker.your-subdomain.workers.dev").rstrip("/")
@@ -840,6 +841,29 @@ def sync_new_device(acct: Acct, auth) -> bool:
     return ok
 
 
+def report_device_decision(acct: Acct, hash_str: str, status: str) -> None:
+    """Write a device record's outcome back to the Worker (v0.5.30).
+
+    Until now the monitor applied device decisions locally but never
+    told the Worker, so a record the owner had not decided with the
+    alert buttons stayed "pending" in KV forever once its local
+    pending entry was gone (auto-revoke, vanished session, baseline
+    rebuild after a restart), and /status counted it forever. The
+    Worker closes the record when this lands; a lost report is
+    retried by reconcile_pending on a later poll, so the two sides
+    converge.
+    """
+    data = post_worker("/device-decision", {
+        "account": acct.phone,
+        "hash": str(hash_str),
+        "status": status,
+    })
+    if data and data.get("ok"):
+        log.info("[%s] Device decision reported: hash=%s -> %s", acct.phone, hash_str, status)
+    else:
+        log.warning("[%s] Device decision report failed, reconcile will retry: hash=%s -> %s", acct.phone, hash_str, status)
+
+
 async def revoke_session(client: TelegramClient, hash_int: int) -> bool:
     try:
         await client(ResetAuthorizationRequest(hash_int))
@@ -918,6 +942,7 @@ async def check_once(acct: Acct) -> None:
     for h in list(pending):
         if h not in current:
             pending.pop(h, None)
+            report_device_decision(acct, h, "gone")
 
     save_account_state(acct.phone, {"sessions": known, "fingerprint": fingerprint(auths), "pending": pending})
     if new_hashes or gone_hashes:
@@ -1882,6 +1907,7 @@ async def apply_device_decision(acct: Acct, hash_str: str, kind: str, auto: bool
         except ValueError:
             pending.pop(hash_str, None)
             save_account_state(acct.phone, {"sessions": known, "pending": pending})
+            report_device_decision(acct, hash_str, "gone")
             return True
         ok = await revoke_session(acct.client, hash_int)
         pending.pop(hash_str, None)
@@ -1902,6 +1928,11 @@ async def apply_device_decision(acct: Acct, hash_str: str, kind: str, auto: bool
     else:
         return False
     save_account_state(acct.phone, {"sessions": known, "pending": pending})
+    # v0.5.30: write the outcome back to the Worker so its record closes.
+    if kind == "allow":
+        report_device_decision(acct, hash_str, "allow")
+    elif kind == "revoke":
+        report_device_decision(acct, hash_str, "revoke" if ok else "gone")
     # A decision just changed the baseline (allow / revoke / auto-revoke):
     # push the fresh snapshot to the Worker now instead of waiting for
     # the next hourly heartbeat, so /devices shows it immediately.
@@ -1935,6 +1966,49 @@ async def process_pending(acct: Acct, data: dict) -> None:
             await apply_device_decision(acct, h, "allow", False, auto_revoke_after)
         elif status == "revoke" or (status == "pending" and not paused and elapsed >= auto_revoke_after):
             await apply_device_decision(acct, h, "revoke", status == "pending", auto_revoke_after)
+
+
+async def reconcile_pending(acct: Acct, data: dict) -> None:
+    """Close Worker device records the local state no longer tracks
+    (v0.5.30 backstop).
+
+    A KV record can outlive its local pending entry when the session
+    vanished before its window expired (check_once drops it locally),
+    when a restart rebuilt the baseline around a still-live session,
+    or when a decision writeback was lost. The record then stays
+    "pending" in KV forever and /status counts it forever. Each poll,
+    any KV record still "pending" whose hash is not in the local
+    pending list is resolved from the local state: in the baseline
+    -> "allow", otherwise -> "gone". Records younger than
+    RECONCILE_GRACE_SECONDS are skipped (check_once may have created
+    one seconds ago and not saved its state yet), and nothing runs
+    while the local state is empty (fresh start, before the first
+    session check baselines the account).
+    """
+    state = load_account_state(acct.phone)
+    known = state.get("sessions", {})
+    local_pending = state.get("pending", {})
+    if not known and not local_pending:
+        return
+    per = per_account(data, acct.phone)
+    now = time.time()
+    for item in per.get("pending", []):
+        if item.get("status") != "pending":
+            continue
+        h = str(item.get("hash"))
+        if h in local_pending:
+            continue
+        detected = None
+        raw_detected = item.get("detected_at")
+        if raw_detected:
+            try:
+                detected = datetime.fromisoformat(str(raw_detected).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                detected = None
+        if detected is not None and now - detected < RECONCILE_GRACE_SECONDS:
+            continue
+        report_device_decision(acct, h, "allow" if h in known else "gone")
+
 
 
 # QR onboarding (v0.5.25): each QR token lives ~30 s; the monitor
@@ -2567,6 +2641,7 @@ async def main() -> None:
                         acct.last_heartbeat = time.time()
                     await apply_resume_rebase(acct, data)
                     await process_pending(acct, data)
+                    await reconcile_pending(acct, data)
                     await process_code_events(acct, data)
                     await process_flood_probe(acct, data)
                     await process_sustain(acct, data)

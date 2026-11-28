@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.31
+ * TG Guardian Worker v1.4.32
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -32,6 +32,9 @@
  *   GET  /        = health check
  *   POST /webhook = Telegram updates (messages + inline button taps)
  *   POST /sync    = monitor reports a new device {account, ...}
+ *   POST /device-decision = monitor writes back a device outcome
+ *                   {account, hash, status: allow|revoke|gone}; the Worker
+ *                   closes the pending record (v1.4.32).
  *   GET  /pending = monitor polls decisions for ALL accounts at once.
  *                   Also returns accounts, removed accounts, onboard
  *                   requests, and per-account settings.
@@ -267,9 +270,21 @@
  * buttons again so the owner can still act manually, and the note
  * that nothing will be auto-handled while paused stays in place
  * of the auto-act countdown.
+ *
+ * DEVICE DECISION WRITEBACK (v1.4.32): new POST /device-decision
+ * endpoint - the monitor reports the outcome of a device record
+ * (allow / revoke / gone) and the Worker closes the record. Until
+ * now the monitor applied device decisions locally but never wrote
+ * them back, so any record the owner did not decide with the alert
+ * buttons stayed "pending" in KV forever once the monitor's local
+ * entry was gone (auto-revoke, vanished session, baseline rebuild
+ * after a restart) and /status counted it forever (2026-11-28: 3
+ * records from 11-25/26 stuck for days on the main account).
+ * Pairs with monitor v0.5.30, which reports on every decision and
+ * reconciles leftovers on every poll.
  */
 
-const VERSION = "1.4.31";
+const VERSION = "1.4.32";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -2216,6 +2231,40 @@ ctx.waitUntil(sendMessage(env, env.OWNER_ID, alertText, false, kb));
 }
 return Response.json({ ok: true, alert_sent: settings.alerts_enabled!== false});
 }
+
+// Monitor writes back a device decision outcome (v1.4.32). Until
+// now the monitor applied allow / auto-revoke locally but never
+// told the Worker, so records the owner did not decide with the
+// alert buttons stayed "pending" in KV forever once the monitor's
+// local entry was gone, and /status counted them forever. Auth and
+// account resolution match /sync; already-decided records are left
+// untouched so a stale or duplicate report can never overwrite the
+// owner's own button decision.
+if (request.method === "POST" && url.pathname === "/device-decision") {
+let body;
+try { body = await request.json();} catch { return new Response("Bad Request", { status: 400});}
+if (body.token!== env.BOT_TOKEN ||!body.hash) {
+return new Response("Forbidden", { status: 403});
+}
+const decidedStatus = String(body.status || "");
+if (!["allow", "revoke", "gone"].includes(decidedStatus)) {
+return new Response("Bad Request", { status: 400});
+}
+const phone = await resolveBodyAccount(body);
+if (phone === undefined) return new Response("Bad Request", { status: 400});
+const pending = await getPendingList(env, phone);
+const item = pending.find((p) => String(p.hash) === String(body.hash));
+if (!item) return Response.json({ ok: true, missing: true});
+if (item.status!== "pending") return Response.json({ ok: true, already: item.status});
+item.status = decidedStatus;
+item.decided_at = new Date().toISOString();
+item.decided_by = "monitor";
+await savePendingList(env, phone, pending);
+const word = decidedStatus === "allow"? "已确认放行": decidedStatus === "revoke"? "已注销": "会话已不存在，结案";
+await appendAlert(env, phone, `[${item.decided_at}] 待确认设备结案：${item.device} ${item.app} ${item.country} — ${word}（监控端回写）`);
+return Response.json({ ok: true});
+}
+
 
 if (request.method === "POST" && url.pathname === "/webhook") {
 const secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
