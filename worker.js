@@ -1,5 +1,5 @@
 /**
- * TG Guardian Worker v1.4.32
+ * TG Guardian Worker v1.4.33
  * Cloudflare Worker + KV (TG_GUARD_DATA) + Telegram Bot API.
  * Env: BOT_TOKEN, OWNER_ID, WEBHOOK_SECRET, KV binding TG_GUARD_DATA.
  * Author: TG https://t.me/ziixiix
@@ -282,9 +282,23 @@
  * records from 11-25/26 stuck for days on the main account).
  * Pairs with monitor v0.5.30, which reports on every decision and
  * reconciles leftovers on every poll.
+ *
+ * ACCOUNT PICKER BUTTONS (v1.4.33): every "several accounts, pick
+ * one" prompt now carries one inline button per account instead of
+ * making the owner copy a phone number into the command. A tap
+ * re-runs the command through the generic cmd: callback fallback
+ * with the account (plus any arguments already given, e.g. the
+ * seconds for /set_guard or the new name for /rename_account)
+ * filled in. Buttons whose callback_data would exceed Telegram's
+ * 64-byte limit are skipped; if none fit, the prompt stays plain
+ * text as before. Covers /clear_alerts, /clear_logs, /clear_flood,
+ * /check_flood, /login_guard, /flood_status, /alert_on, /alert_off,
+ * /sustain_flood_on, /sustain_flood_off, /rename_account,
+ * /set_guard, /set_revoke and the /stop_qr multi-login prompt.
+ * Monitor unchanged.
  */
 
-const VERSION = "1.4.32";
+const VERSION = "1.4.33";
 
 // Wake-up marker (v1.4.9): sent as a short bot message after any decision
 // button tap so the monitor polls /pending immediately instead of waiting
@@ -423,6 +437,30 @@ async function resolveViewTargets(env, args) {
 
 function choiceText(accounts) {
   return "有多个账号，请指定一个：\n" + accounts.map((a) => `· ${accountLabel(a)} — ${displayPhone(a.phone)}`).join("\n");
+}
+
+// Account picker buttons (v1.4.33): when a command needs one account
+// out of several, attach one inline button per account instead of
+// making the owner type the phone number. A tap re-runs the command
+// through the generic "cmd:" callback fallback with the account (and
+// any already-given arguments) filled in. Telegram caps callback_data
+// at 64 bytes: a button that would overflow is skipped, and if no
+// button fits the prompt stays plain text as before.
+function accountChoiceKeyboard(accounts, buildCmd) {
+  const rows = [];
+  for (const a of accounts) {
+    const data = "cmd:" + buildCmd(a);
+    if (new TextEncoder().encode(data).length > 64) continue;
+    rows.push([{ text: `${accountLabel(a)} · ${displayPhone(a.phone)}`, callback_data: data }]);
+  }
+  return rows.length ? { inline_keyboard: rows } : null;
+}
+
+async function sendChoicePrompt(env, chatId, accounts, usage, buildCmd) {
+  const kb = accountChoiceKeyboard(accounts, buildCmd);
+  const text = choiceText(accounts) + "\n用法：" + usage;
+  if (kb) return sendMessage(env, chatId, text, false, kb);
+  return sendMessage(env, chatId, text, true);
 }
 
 // --- KV: raw helpers + per-account keys. phone === null means the
@@ -1251,7 +1289,10 @@ async function runCommand(env, chatId, fromId, rawText, ctx) {
         return sendMessage(env, chatId, "现在没有正在进行的扫码登录。", true);
       }
       if (qrItems.length > 1) {
-        return sendMessage(env, chatId, "有多个扫码登录在进行，请指定一个：\n" + qrItems.map((o) => `· ${accountLabel(o)} — ${displayPhone(o.phone)}`).join("\n"), true);
+        const qrKb = accountChoiceKeyboard(qrItems, (o) => `/stop_qr ${o.phone}`);
+        const qrText = "有多个扫码登录在进行，请指定一个：\n" + qrItems.map((o) => `· ${accountLabel(o)} — ${displayPhone(o.phone)}`).join("\n");
+        if (qrKb) return sendMessage(env, chatId, qrText, false, qrKb);
+        return sendMessage(env, chatId, qrText, true);
       }
       item = qrItems[0];
     }
@@ -1381,7 +1422,7 @@ if (cmd === "/sustain_flood_on") {
   const res = await resolveAccountArg(env, rest);
   if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
   if (res.error) return sendMessage(env, chatId, res.error, true);
-  if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} [分钟] <手机号或名字>`, true);
+  if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} [分钟] <手机号或名字>`, (a) => minutesArg ? `${cmd} ${minutesArg} ${a.phone}` : `${cmd} ${a.phone}`);
   const acct = (res.account ? [res.account] : res.accounts)[0];
   if (!minutesArg) {
     const s = await getSustain(env, acct.phone);
@@ -1399,7 +1440,7 @@ if (cmd === "/sustain_flood_off") {
   const res = await resolveAccountArg(env, args);
   if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
   if (res.error) return sendMessage(env, chatId, res.error, true);
-  if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
+  if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} <手机号或名字>`, (a) => `${cmd} ${a.phone}`);
   const acct = (res.account ? [res.account] : res.accounts)[0];
   await clearSustain(env, acct.phone);
   if (ctx) ctx.waitUntil(sendWakeup(env));
@@ -1419,7 +1460,7 @@ if (cmd === "/rename_account") {
   const res = await resolveAccountArg(env, args.slice(0, -1));
   if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
   if (res.error) return sendMessage(env, chatId, res.error, true);
-  if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字> <新名字>`, true);
+  if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} <手机号或名字> <新名字>`, (a) => `${cmd} ${a.phone} ${newName}`);
   const acct = (res.account ? [res.account] : res.accounts)[0];
   const list = await getAccounts(env);
   const clash = list.find((a) => a.phone !== acct.phone && a.name && a.name === newName);
@@ -1467,7 +1508,7 @@ if (cmd === "/login_guard") {
 const res = await resolveAccountArg(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
+if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} <手机号或名字>`, (a) => `${cmd} ${a.phone}`);
 const targets = res.account? [res.account]: res.accounts;
 let out = "🛡️ 反登录防护状态\n";
 for (const acct of targets) {
@@ -1489,7 +1530,7 @@ if (cmd === "/flood_status") {
 const res = await resolveAccountArg(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
+if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} <手机号或名字>`, (a) => `${cmd} ${a.phone}`);
 const targets = res.account? [res.account]: res.accounts;
 let out = "🌊 Flood 状态\n";
 let any = false;
@@ -1558,7 +1599,7 @@ if (cmd === "/alert_on" || cmd === "/alert_off") {
 const res = await resolveAccountArg(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
+if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} <手机号或名字>`, (a) => `${cmd} ${a.phone}`);
 const settings = await getSettings(env, res.account.phone);
 settings.alerts_enabled = cmd === "/alert_on";
 await saveSettings(env, res.account.phone, settings);
@@ -1623,7 +1664,7 @@ if (cmd === "/clear_alerts" || cmd === "/clear_logs") {
 const res = await resolveAccountArg(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
+if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} <手机号或名字>`, (a) => `${cmd} ${a.phone}`);
 const logs = (await kvGetAcct(env, res.account.phone, "alerts")) || "";
 const n = logs.split("\n").filter((l) => l.trim()).length;
 await kvPutAcct(env, res.account.phone, "alerts", "");
@@ -1633,7 +1674,7 @@ if (cmd === "/clear_flood") {
 const res = await resolveAccountArg(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
+if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} <手机号或名字>`, (a) => `${cmd} ${a.phone}`);
 const cleared = await clearFloodIfActive(env, null, res.account.phone, false, false);
 if (ctx) ctx.waitUntil(sendWakeup(env));
 return sendMessage(env, chatId, cleared? `✅ 已手动清除账号【${accountLabel(res.account)}】的 Flood 记录，面板将显示未触发。`: `📋 账号【${accountLabel(res.account)}】没有已记录的 Flood，不用清除。`, true);
@@ -1642,7 +1683,7 @@ if (cmd === "/check_flood") {
 const res = await resolveAccountArg(env, args);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} <手机号或名字>`, true);
+if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} <手机号或名字>`, (a) => `${cmd} ${a.phone}`);
 const existing = await kvGetAcct(env, res.account.phone, "flood_probe");
 if (existing) return sendMessage(env, chatId, `🔍 账号【${accountLabel(res.account)}】已经在检查了，稍等，结果会通知你。`, true);
 await kvPutAcct(env, res.account.phone, "flood_probe", JSON.stringify({ requested_at: new Date().toISOString() }));
@@ -1666,7 +1707,7 @@ return sendMessage(env, chatId, `用法：${cmd} <秒> [账号]，秒是 60–36
 const res = await resolveAccountArg(env, rest);
 if (res.none) return sendMessage(env, chatId, "👥 还没有账号。发 /add_account <手机号> [名字] 添加第一个账号。", true);
 if (res.error) return sendMessage(env, chatId, res.error, true);
-if (res.needChoice) return sendMessage(env, chatId, choiceText(res.accounts) + `\n用法：${cmd} ${seconds} <手机号或名字>`, true);
+if (res.needChoice) return sendChoicePrompt(env, chatId, res.accounts, `${cmd} ${seconds} <手机号或名字>`, (a) => `${cmd} ${seconds} ${a.phone}`);
 const settings = await getSettings(env, res.account.phone);
 settings[cmd === "/set_guard"? "auto_code_after": "auto_revoke_after"] = seconds;
 await saveSettings(env, res.account.phone, settings);
